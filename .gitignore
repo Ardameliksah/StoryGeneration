@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Trained model checkpoints (large binary files)
+models/
+
+# Dataset files (raw and processed — reproduce with prepare_data.py)
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
