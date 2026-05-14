@@ -1,5 +1,19 @@
-"""Fine-tune T5-small: storytitle → pseudo-outline (sentence1 + sentence3 + sentence5)."""
+"""Fine-tune T5-small: prompt → EtriCA-style event-sequence outline.
 
+Supports ROCStories and WritingPrompts. Designed for epoch-by-epoch training
+on Colab — each session trains --epochs epochs then saves full state to Drive.
+
+Usage:
+    # ROCStories (default)
+    python train_outline.py
+
+    # WritingPrompts, one epoch at a time
+    python train_outline.py --data wp --epochs 1
+    python train_outline.py --data wp --epochs 1 --resume   # next session
+    python train_outline.py --data wp --epochs 1 --resume   # next session
+"""
+
+import argparse
 import json
 import pathlib
 
@@ -9,15 +23,25 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import T5ForConditionalGeneration, T5TokenizerFast, get_linear_schedule_with_warmup
 
 MODEL_NAME = "t5-small"
-TRAIN_FILE = "data/processed/outline_train.jsonl"
-VAL_FILE   = "data/processed/outline_val.jsonl"
-OUTPUT_DIR = "models/t5_outline"
 MAX_IN     = 64
 MAX_OUT    = 128
-BATCH      = 16
-EPOCHS     = 3
 LR         = 2e-5
-DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE     = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+DATA_CONFIG = {
+    "roc": {
+        "train": "data/processed/outline_train.jsonl",
+        "val":   "data/processed/outline_val.jsonl",
+        "out":   "models/t5_outline",
+        "batch": 16,
+    },
+    "wp": {
+        "train": "data/processed/wp_outline_train.jsonl",
+        "val":   "data/processed/wp_outline_val.jsonl",
+        "out":   "models/t5_outline_wp",
+        "batch": 8,
+    },
+}
 
 
 class OutlineDataset(Dataset):
@@ -30,7 +54,6 @@ class OutlineDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         row = self.data[idx]
-        # T5 uses task prefix in the input
         inp = self.tok(
             f"generate outline: {row['input']}",
             max_length=MAX_IN,
@@ -64,25 +87,59 @@ def evaluate(model: T5ForConditionalGeneration, loader: DataLoader) -> float:
     return total_loss / len(loader)
 
 
-def train() -> None:
-    print(f"Device: {DEVICE}")
-    tokenizer = T5TokenizerFast.from_pretrained(MODEL_NAME)
-    model     = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+def train(args: argparse.Namespace) -> None:
+    cfg        = DATA_CONFIG[args.data]
+    output_dir = pathlib.Path(cfg["out"])
+    state_file = output_dir / "training_state.pt"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # num_workers=0 required on Windows
-    train_loader = DataLoader(OutlineDataset(TRAIN_FILE, tokenizer), batch_size=BATCH, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(OutlineDataset(VAL_FILE,   tokenizer), batch_size=BATCH, shuffle=False, num_workers=0)
+    print(f"Device: {DEVICE} | Dataset: {args.data}")
 
-    total_steps = len(train_loader) * EPOCHS
-    optimizer   = AdamW(model.parameters(), lr=LR)
-    scheduler   = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=total_steps // 10, num_training_steps=total_steps
+    # ── Load model ──────────────────────────────────────────────────────────
+    if args.resume and state_file.exists():
+        print(f"Resuming from {output_dir} ...")
+        tokenizer     = T5TokenizerFast.from_pretrained(output_dir)
+        model         = T5ForConditionalGeneration.from_pretrained(output_dir).to(DEVICE)
+        state         = torch.load(state_file, map_location=DEVICE)
+        start_epoch   = state["epoch"] + 1
+        best_val_loss = state["best_val_loss"]
+        total_steps   = state["total_steps"]
+        print(f"  Resuming from epoch {start_epoch} | best_val_loss={best_val_loss:.4f}")
+    else:
+        tokenizer = T5TokenizerFast.from_pretrained(MODEL_NAME)
+        model     = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+        start_epoch   = 1
+        best_val_loss = float("inf")
+        total_steps   = None  # set after dataloaders are built
+
+    # ── Data ────────────────────────────────────────────────────────────────
+    train_loader = DataLoader(
+        OutlineDataset(cfg["train"], tokenizer),
+        batch_size=cfg["batch"], shuffle=True, num_workers=0,
+    )
+    val_loader = DataLoader(
+        OutlineDataset(cfg["val"], tokenizer),
+        batch_size=cfg["batch"], shuffle=False, num_workers=0,
     )
 
-    best_val_loss = float("inf")
-    pathlib.Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    # ── Optimiser & scheduler ────────────────────────────────────────────────
+    if total_steps is None:
+        total_steps = len(train_loader) * 3  # assume 3-epoch plan for LR schedule
 
-    for epoch in range(1, EPOCHS + 1):
+    optimizer = AdamW(model.parameters(), lr=LR)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=total_steps // 10,
+        num_training_steps=total_steps,
+    )
+
+    if args.resume and state_file.exists():
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+
+    # ── Training loop ────────────────────────────────────────────────────────
+    end_epoch = start_epoch + args.epochs
+    for epoch in range(start_epoch, end_epoch):
         model.train()
         running_loss = 0.0
         for step, batch in enumerate(train_loader, 1):
@@ -99,12 +156,29 @@ def train() -> None:
 
         val_loss = evaluate(model, val_loader)
         print(f"Epoch {epoch} complete | val_loss={val_loss:.4f}")
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            model.save_pretrained(OUTPUT_DIR)
-            tokenizer.save_pretrained(OUTPUT_DIR)
-            print(f"  Checkpoint saved to {OUTPUT_DIR}")
+            model.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            print(f"  Best model saved to {output_dir}")
+
+        # Save training state after every epoch so Colab can resume
+        torch.save({
+            "epoch":         epoch,
+            "best_val_loss": best_val_loss,
+            "optimizer":     optimizer.state_dict(),
+            "scheduler":     scheduler.state_dict(),
+            "total_steps":   total_steps,
+        }, state_file)
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data",   choices=["roc", "wp"], default="roc",
+                        help="Dataset to train on (default: roc)")
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="Epochs to train this session (default: 1)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from last saved checkpoint")
+    train(parser.parse_args())
