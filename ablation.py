@@ -1,27 +1,33 @@
 """Ablation study — measures the contribution of each pipeline component.
 
-Six conditions are evaluated side-by-side across four metrics.
+Two separate ablation suites:
+  --data roc  (default)  ROC conditions + premise_trained
+  --data wp              Full WP ablation on WritingPrompts models/data
 
-Conditions
-----------
-full          Baseline  : T5 event outline + DOME memory  (ROC models, ROC val)
-no_memory     -DOME     : event outline, no memory block
-no_outline    -Outline  : title → BART only (no outline, no memory)
-with_premise  +Premise  : full + structured premise text in BART input
-sent_outline  Sent OL   : oracle sentence outline (begin|mid|end from reference)
-wp_models     WP Data   : full pipeline with WritingPrompts-trained models (WP val)
+ROC conditions
+--------------
+full            Baseline  : T5 event outline + DOME memory  (ROC models)
+no_memory       -DOME     : event outline, no memory block
+no_outline      -Outline  : title → BART only
+with_premise    +Premise* : full + premise in BART input (inference-only, unfair)
+sent_outline    Sent OL   : oracle sentence outline (upper bound)
+wp_models       WP cross  : full pipeline with WP-trained models on WP val
+premise_trained +Premise  : premise-TRAINED BART + premise at inference (fair test)
 
-The 'sent_outline' condition is an oracle upper-bound: it feeds actual
-sentences from the reference story as the outline, showing the maximum gain
-possible from a perfect outline generator.
+WP conditions  (--data wp)
+--------------------------
+full            WP full pipeline
+no_memory       WP, no DOME memory
+no_outline      WP, title → BART only
+sent_outline    WP, oracle sentence outline (upper bound)
 
 Usage
 -----
-    python ablation.py                   # 200 examples, val split
-    python ablation.py --n 50            # quick smoke test (~5 min on T4)
-    python ablation.py --n 200 --split test
-    python ablation.py --bert-model roberta-large  # higher-quality BERTScore
-    python ablation.py --conditions full no_memory wp_models  # subset
+    python ablation.py                          # ROC, 200 examples
+    python ablation.py --n 50                   # quick smoke test
+    python ablation.py --data wp --n 200        # full WP ablation
+    python ablation.py --conditions full no_memory premise_trained
+    python ablation.py --bert-model roberta-large
 """
 
 import argparse
@@ -37,7 +43,7 @@ from inference import (
 import metrics
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Data configs
 # ---------------------------------------------------------------------------
 
 _SENT_RE = re.compile(r'(?<=[.!?])\s+')
@@ -56,6 +62,92 @@ WP_CFG = {
     "bart": "models/bart_story_wp",
 }
 
+# Same reference data as ROC, but uses the premise-trained BART checkpoint
+ROC_PREMISE_CFG = {
+    "val":  "data/processed/story_val.jsonl",
+    "test": "data/processed/story_test.jsonl",
+    "t5":   "models/t5_outline",
+    "bart": "models/bart_story_premise",   # trained with premise in input
+}
+
+_DATA_CFGS = {
+    "roc":         ROC_CFG,
+    "wp":          WP_CFG,
+    "roc_premise": ROC_PREMISE_CFG,
+}
+
+# ---------------------------------------------------------------------------
+# Condition registries
+# ---------------------------------------------------------------------------
+
+# Each entry: (label, kwargs for _run_condition, data_config_key)
+ROC_ABLATION_CONDITIONS: list[tuple[str, dict, str]] = [
+    (
+        "full",
+        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=False),
+        "roc",
+    ),
+    (
+        "no_memory",
+        dict(use_memory=False, use_outline=True,  use_premise=False, use_sent_outline=False),
+        "roc",
+    ),
+    (
+        "no_outline",
+        dict(use_memory=False, use_outline=False, use_premise=False, use_sent_outline=False),
+        "roc",
+    ),
+    (
+        "with_premise",
+        dict(use_memory=True,  use_outline=True,  use_premise=True,  use_sent_outline=False),
+        "roc",       # inference-only: BART not trained with premise (unfair baseline)
+    ),
+    (
+        "sent_outline",
+        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=True),
+        "roc",
+    ),
+    (
+        "wp_models",
+        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=False),
+        "wp",        # cross-dataset: WP models evaluated on WP val data
+    ),
+    (
+        "premise_trained",
+        dict(use_memory=True,  use_outline=True,  use_premise=True,  use_sent_outline=False),
+        "roc_premise",   # BART retrained with premise → fair test
+    ),
+]
+
+WP_ABLATION_CONDITIONS: list[tuple[str, dict, str]] = [
+    (
+        "full",
+        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=False),
+        "wp",
+    ),
+    (
+        "no_memory",
+        dict(use_memory=False, use_outline=True,  use_premise=False, use_sent_outline=False),
+        "wp",
+    ),
+    (
+        "no_outline",
+        dict(use_memory=False, use_outline=False, use_premise=False, use_sent_outline=False),
+        "wp",
+    ),
+    (
+        "sent_outline",
+        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=True),
+        "wp",
+    ),
+]
+
+_ROC_NAMES = [c[0] for c in ROC_ABLATION_CONDITIONS]
+_WP_NAMES  = [c[0] for c in WP_ABLATION_CONDITIONS]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _load_examples(path: str, n: int) -> list[dict]:
     examples = []
@@ -68,30 +160,22 @@ def _load_examples(path: str, n: int) -> list[dict]:
 
 
 def _extract_title(input_field: str) -> str:
-    """Strip ' outline: ...' suffix added during data prep."""
-    return input_field.split(" outline:")[0].strip()
+    """Strip ' outline: ...' and ' premise: ...' suffixes."""
+    return input_field.split(" outline:")[0].split(" premise:")[0].strip()
 
 
 def _sentence_outline(story: str) -> str:
-    """Oracle sentence outline: first | middle | last sentence from reference.
-
-    Used in the 'sent_outline' condition to show the upper bound of what a
-    perfect outline generator could achieve.
-    """
+    """Oracle sentence outline: first | middle | last sentence from reference."""
     sents = [s.strip() for s in _SENT_RE.split(story) if len(s.strip()) > 5]
     if len(sents) < 2:
         return story
-    s_begin = sents[0]
-    s_mid   = sents[len(sents) // 2]
-    s_end   = sents[-1]
-    return f"{s_begin} | {s_mid} | {s_end}"
+    return f"{sents[0]} | {sents[len(sents) // 2]} | {sents[-1]}"
 
 
 def _set_checkpoints(t5_path: str, bart_path: str) -> None:
-    """Hot-swap the model checkpoints used by the inference module."""
     inference.T5_CHECKPOINT   = t5_path
     inference.BART_CHECKPOINT = bart_path
-    inference._outline_cache  = None   # force reload
+    inference._outline_cache  = None
     inference._story_cache    = None
 
 
@@ -109,7 +193,6 @@ def _run_condition(
     use_premise: bool      = False,
     use_sent_outline: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Generate stories for all examples under one ablation condition."""
     _set_checkpoints(t5_path, bart_path)
     hypotheses: list[str] = []
     references: list[str] = []
@@ -118,18 +201,12 @@ def _run_condition(
         title = _extract_title(ex["input"])
         ref   = ex["target"]
 
-        # ── Choose outline ────────────────────────────────────────────────
-        if not use_outline:
-            outline = ""
-        elif use_sent_outline:
-            outline = _sentence_outline(ref)    # oracle from reference
-        else:
-            outline = generate_outline(title)   # T5-generated event outline
-
-        # ── Memory ───────────────────────────────────────────────────────
-        memory = extract_memory(title) if use_memory else ""
-
-        # ── Premise ──────────────────────────────────────────────────────
+        outline = (
+            ""                          if not use_outline else
+            _sentence_outline(ref)      if use_sent_outline else
+            generate_outline(title)
+        )
+        memory  = extract_memory(title) if use_memory  else ""
         premise = expand_premise(title) if use_premise else ""
 
         pred = generate_story(
@@ -149,47 +226,6 @@ def _run_condition(
 
 
 # ---------------------------------------------------------------------------
-# Condition registry
-# ---------------------------------------------------------------------------
-
-# Each entry: (name, kwargs for _run_condition, data_config_key)
-ABLATION_CONDITIONS: list[tuple[str, dict, str]] = [
-    (
-        "full",
-        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=False),
-        "roc",
-    ),
-    (
-        "no_memory",
-        dict(use_memory=False, use_outline=True,  use_premise=False, use_sent_outline=False),
-        "roc",
-    ),
-    (
-        "no_outline",
-        dict(use_memory=False, use_outline=False, use_premise=False, use_sent_outline=False),
-        "roc",
-    ),
-    (
-        "with_premise",
-        dict(use_memory=True,  use_outline=True,  use_premise=True,  use_sent_outline=False),
-        "roc",
-    ),
-    (
-        "sent_outline",
-        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=True),
-        "roc",
-    ),
-    (
-        "wp_models",
-        dict(use_memory=True,  use_outline=True,  use_premise=False, use_sent_outline=False),
-        "wp",
-    ),
-]
-
-_CONDITION_NAMES = [c[0] for c in ABLATION_CONDITIONS]
-
-
-# ---------------------------------------------------------------------------
 # Main ablation runner
 # ---------------------------------------------------------------------------
 
@@ -198,40 +234,45 @@ def ablation(
     split: str            = "val",
     bert_model: str       = "distilbert-base-uncased",
     conditions: list[str] | None = None,
+    data: str             = "roc",
 ) -> dict[str, dict[str, float]]:
-    """Run the ablation study and print a comparison table.
+    """Run one ablation suite and return results as a dict.
 
     Parameters
     ----------
-    n          : number of evaluation examples per condition
-    split      : 'val' or 'test'
-    bert_model : HuggingFace model ID for BERTScore
-    conditions : subset of condition names to run (default: all)
+    data : 'roc' runs the ROC conditions (incl. premise_trained);
+           'wp'  runs the WritingPrompts conditions.
     """
-    data_cfgs = {"roc": ROC_CFG, "wp": WP_CFG}
-    active = conditions or _CONDITION_NAMES
+    if data == "wp":
+        active_registry = WP_ABLATION_CONDITIONS
+        default_names   = _WP_NAMES
+        suite_label     = "WritingPrompts"
+    else:
+        active_registry = ROC_ABLATION_CONDITIONS
+        default_names   = _ROC_NAMES
+        suite_label     = "ROCStories"
 
+    active = conditions or default_names
     all_results: dict[str, dict[str, float]] = {}
 
-    for label, kwargs, data_key in ABLATION_CONDITIONS:
+    for label, kwargs, cfg_key in active_registry:
         if label not in active:
             continue
 
-        cfg  = data_cfgs[data_key]
+        cfg  = _DATA_CFGS[cfg_key]
         path = cfg[split]
 
-        # Skip gracefully if data / model checkpoints are missing
         if not pathlib.Path(path).exists():
             print(f"\n[SKIP] {label}: data not found at {path}")
             continue
-        if not pathlib.Path(cfg["t5"], "config.json").exists():
+        if not pathlib.Path(cfg["t5"],   "config.json").exists():
             print(f"\n[SKIP] {label}: T5 checkpoint not found at {cfg['t5']}")
             continue
         if not pathlib.Path(cfg["bart"], "config.json").exists():
             print(f"\n[SKIP] {label}: BART checkpoint not found at {cfg['bart']}")
             continue
 
-        print(f"\n── Condition: {label} {'─'*(40-len(label))}")
+        print(f"\n── {suite_label} | {label} {'─'*(35-len(label))}")
         examples = _load_examples(path, n)
         hyps, refs = _run_condition(label, examples, cfg["t5"], cfg["bart"], **kwargs)
 
@@ -244,26 +285,25 @@ def ablation(
         print("\nNo results — make sure models and data are present.")
         return all_results
 
-    W = 72
+    W = 74
     print(f"\n\n{'='*W}")
-    print(f"{'ABLATION RESULTS':^{W}}")
+    print(f"{'ABLATION RESULTS — ' + suite_label:^{W}}")
     print(f"{'n=' + str(n) + ' | split=' + split:^{W}}")
     print(f"{'='*W}")
-    print(f"{'Condition':<16}  {'ROUGE-L':>9}  {'BLEU':>7}  {'METEOR':>8}  {'BERTScore':>10}")
+    print(f"{'Condition':<18}  {'ROUGE-L':>9}  {'BLEU':>7}  {'METEOR':>8}  {'BERTScore':>10}")
     print("-" * W)
 
-    # Bold the best score in each column (ASCII marker)
     col_keys = ["rouge_l", "bleu", "meteor", "bertscore"]
     col_best = {k: max(v[k] for v in all_results.values()) for k in col_keys}
 
     for label, scores in all_results.items():
-        def fmt(k: str, fmt_str: str) -> str:
-            val = scores[k]
-            s   = format(val, fmt_str)
-            return f"*{s}*" if abs(val - col_best[k]) < 1e-6 else f" {s} "
+        def fmt(k: str, fs: str) -> str:
+            v = scores[k]
+            s = format(v, fs)
+            return f"*{s}*" if abs(v - col_best[k]) < 1e-6 else f" {s} "
 
         print(
-            f"{label:<16}  "
+            f"{label:<18}  "
             f"{fmt('rouge_l',  '.4f'):>10}  "
             f"{fmt('bleu',     '.2f'):>8}  "
             f"{fmt('meteor',   '.4f'):>9}  "
@@ -272,20 +312,27 @@ def ablation(
 
     print("=" * W)
     print("  * = best in column")
-    print()
-    print("Condition legend:")
-    print("  full         – T5 event outline + DOME memory (ROC models)")
-    print("  no_memory    – DOME memory module removed")
-    print("  no_outline   – no outline fed to story model")
-    print("  with_premise – structured premise prepended to BART input")
-    print("  sent_outline – oracle sentence outline (upper bound)")
-    print("  wp_models    – WritingPrompts-trained models on WP val data")
+
+    if data == "roc":
+        print()
+        print("Condition legend:")
+        print("  full            – T5 event outline + DOME memory (ROC models)")
+        print("  no_memory       – DOME memory removed")
+        print("  no_outline      – outline removed entirely")
+        print("  with_premise    – premise at inference (BART not trained for it — unfair)")
+        print("  sent_outline    – oracle sentence outline (upper bound)")
+        print("  wp_models       – WP-trained models on WP val data (cross-dataset)")
+        print("  premise_trained – premise-retrained BART + premise at inference (fair)")
 
     return all_results
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data",       choices=["roc", "wp"], default="roc",
+        help="Which ablation suite to run: roc (default) or wp",
+    )
     parser.add_argument(
         "--n",          type=int, default=200,
         help="Examples per condition (default: 200)",
@@ -295,12 +342,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--bert-model", default="distilbert-base-uncased",
-        help="HuggingFace model ID for BERTScore "
-             "(default: distilbert-base-uncased; roberta-large for accuracy)",
+        help="HuggingFace model for BERTScore",
     )
     parser.add_argument(
-        "--conditions", nargs="*", choices=_CONDITION_NAMES,
-        help="Run only these conditions (default: all)",
+        "--conditions", nargs="*",
+        help="Run only these conditions (default: all for chosen --data)",
     )
     args = parser.parse_args()
     ablation(
@@ -308,4 +354,5 @@ if __name__ == "__main__":
         split=args.split,
         bert_model=args.bert_model,
         conditions=args.conditions,
+        data=args.data,
     )

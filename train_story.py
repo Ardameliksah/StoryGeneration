@@ -14,6 +14,9 @@ Usage:
 
     # WritingPrompts with gradient accumulation (simulates larger batch)
     python train_story.py --data wp --epochs 1 --grad-accum 4
+
+    # ROCStories with premise in input (for premise ablation)
+    python train_story.py --data roc_premise --epochs 3
 """
 
 import argparse
@@ -26,7 +29,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import BartForConditionalGeneration, BartTokenizerFast, get_linear_schedule_with_warmup
 
 MODEL_NAME = "facebook/bart-base"
-MAX_IN     = 192
+MAX_IN     = 256   # increased to 256 to fit premise text without truncation
 MAX_OUT    = 256
 LR         = 2e-5
 DEVICE     = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -43,6 +46,13 @@ DATA_CONFIG = {
         "val":   "data/processed/wp_story_val.jsonl",
         "out":   "models/bart_story_wp",
         "batch": 4,   # reduced for longer WP sequences
+    },
+    # BART trained with premise text in the input — for the premise ablation
+    "roc_premise": {
+        "train": "data/processed/story_premise_train.jsonl",
+        "val":   "data/processed/story_premise_val.jsonl",
+        "out":   "models/bart_story_premise",
+        "batch": 8,
     },
 }
 
@@ -188,8 +198,8 @@ def train(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data",       choices=["roc", "wp"], default="roc",
-                        help="Dataset to train on (default: roc)")
+    parser.add_argument("--data",       choices=["roc", "wp", "roc_premise"], default="roc",
+                        help="Dataset to train on: roc (default), wp, or roc_premise")
     parser.add_argument("--epochs",     type=int, default=1,
                         help="Epochs to train this session (default: 1)")
     parser.add_argument("--resume",     action="store_true",

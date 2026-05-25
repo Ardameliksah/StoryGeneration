@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python update_notebook.py)",
+      "Bash(del update_notebook.py)",
+      "Bash(rm update_notebook.py)"
     ]
   }
 }
