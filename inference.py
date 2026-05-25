@@ -3,9 +3,15 @@
 Usage:
     python inference.py "A dog saves the day"
     python inference.py  # uses a built-in example
+    python inference.py --data wp "Humanity discovers faster-than-light travel"
 
 Works zero-shot (no fine-tuning needed). Automatically uses fine-tuned
 checkpoints from models/t5_outline/ and models/bart_story/ when available.
+
+Ablation flags (used by ablation.py):
+    --no-memory    disable DOME memory extraction
+    --no-outline   skip the outline stage (title → BART directly)
+    --use-premise  prepend the structured premise to the BART input
 """
 
 import argparse
@@ -151,11 +157,46 @@ def _load_story_model() -> tuple[BartTokenizerFast, BartForConditionalGeneration
     return _story_cache
 
 
-def generate_story(title: str, outline: str, memory: str = "") -> str:
+def generate_story(
+    title: str,
+    outline: str,
+    memory: str = "",
+    # ── Ablation flags (new, all backward-compatible) ──────────────────────
+    premise: str = "",
+    use_premise: bool = False,
+    use_memory: bool = True,
+    use_outline: bool = True,
+) -> str:
+    """Generate a story from the given title and optional outline / memory.
+
+    Parameters
+    ----------
+    title       : the story prompt / title
+    outline     : event-sequence outline produced by generate_outline()
+    memory      : DOME memory block produced by extract_memory()
+    premise     : structured premise text from expand_premise()
+    use_premise : if True, prepend premise text to the BART input
+    use_memory  : if False, drop the [MEM] block from the BART input
+    use_outline : if False, drop the outline from the BART input
+    """
     tok, model = _load_story_model()
-    mem_str = f" {memory}" if memory else ""
-    prompt  = f"{title} outline: {outline}{mem_str}"
-    ids     = tok(prompt, return_tensors="pt", max_length=192, truncation=True).input_ids.to(DEVICE)
+
+    # Build the input prompt according to the active ablation flags
+    parts: list[str] = [title]
+
+    if use_premise and premise:
+        # Insert premise as extra context before the outline
+        parts.append(f"premise: {premise}")
+
+    if use_outline and outline:
+        parts.append(f"outline: {outline}")
+
+    prompt = " ".join(parts)
+
+    if use_memory and memory:
+        prompt = f"{prompt} {memory}"
+
+    ids = tok(prompt, return_tensors="pt", max_length=192, truncation=True).input_ids.to(DEVICE)
     with torch.no_grad():
         out = model.generate(
             ids,
@@ -176,32 +217,69 @@ def generate_story(title: str, outline: str, memory: str = "") -> str:
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(title: str) -> dict:
+def run_pipeline(
+    title: str,
+    use_memory: bool = True,
+    use_premise: bool = False,
+    use_outline: bool = True,
+    outline_override: str | None = None,
+) -> dict:
+    """Run the full four-stage pipeline.
+
+    Parameters
+    ----------
+    outline_override : if given, skip T5 and use this string as the outline
+                       (used in ablation.py for the 'sentence outline' condition)
+    """
     print(f"\n{'='*60}")
     print(f"Prompt: {title}")
     print("=" * 60)
 
-    memory = extract_memory(title)
-    print(f"\n[Memory Notes]\n{memory if memory else '(none extracted)'}")
-
+    memory  = extract_memory(title) if use_memory else ""
     premise = expand_premise(title)
+
+    print(f"\n[Memory Notes]\n{memory if memory else '(none extracted)'}")
     print(f"\n[Stage 1 — Premise]\n{premise}")
 
-    outline = generate_outline(title)
-    print(f"\n[Stage 2 — Outline]\n{outline}")
+    if outline_override is not None:
+        outline = outline_override
+        print(f"\n[Stage 2 — Outline (override)]\n{outline}")
+    elif use_outline:
+        outline = generate_outline(title)
+        print(f"\n[Stage 2 — Outline]\n{outline}")
+    else:
+        outline = ""
+        print("\n[Stage 2 — Outline] (skipped)")
 
-    story = generate_story(title, outline, memory)
+    story = generate_story(
+        title, outline, memory,
+        premise=premise,
+        use_premise=use_premise,
+        use_memory=use_memory,
+        use_outline=use_outline,
+    )
     print(f"\n[Stage 3 — Story]\n{story}")
     print()
 
-    return {"premise": premise, "outline": outline, "memory": memory, "story": story}
+    return {
+        "premise": premise,
+        "outline": outline,
+        "memory":  memory,
+        "story":   story,
+    }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("prompt", nargs="*", help="Story prompt")
-    parser.add_argument("--data", choices=["roc", "wp"], default="roc",
+    parser.add_argument("prompt",      nargs="*", help="Story prompt")
+    parser.add_argument("--data",      choices=["roc", "wp"], default="roc",
                         help="Which model to use: roc (default) or wp")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="Disable DOME memory extraction")
+    parser.add_argument("--no-outline", action="store_true",
+                        help="Skip outline stage (title → BART directly)")
+    parser.add_argument("--use-premise", action="store_true",
+                        help="Include structured premise in BART input")
     args = parser.parse_args()
 
     if args.data == "wp":
@@ -209,4 +287,9 @@ if __name__ == "__main__":
         BART_CHECKPOINT = "models/bart_story_wp"
 
     title = " ".join(args.prompt) if args.prompt else "She finally found what she had been looking for"
-    run_pipeline(title)
+    run_pipeline(
+        title,
+        use_memory=not args.no_memory,
+        use_premise=args.use_premise,
+        use_outline=not args.no_outline,
+    )

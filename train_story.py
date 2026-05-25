@@ -4,13 +4,16 @@ Supports ROCStories and WritingPrompts. Designed for epoch-by-epoch training
 on Colab — each session trains --epochs epochs then saves full state to Drive.
 
 Usage:
-    # ROCStories (default)
-    python train_story.py
+    # ROCStories (default) — full run
+    python train_story.py --epochs 3
 
-    # WritingPrompts, one epoch at a time
+    # WritingPrompts, one epoch at a time (resumable across Colab sessions)
     python train_story.py --data wp --epochs 1
     python train_story.py --data wp --epochs 1 --resume   # next session
     python train_story.py --data wp --epochs 1 --resume   # next session
+
+    # WritingPrompts with gradient accumulation (simulates larger batch)
+    python train_story.py --data wp --epochs 1 --grad-accum 4
 """
 
 import argparse
@@ -39,7 +42,7 @@ DATA_CONFIG = {
         "train": "data/processed/wp_story_train.jsonl",
         "val":   "data/processed/wp_story_val.jsonl",
         "out":   "models/bart_story_wp",
-        "batch": 4,  # reduced for longer WP sequences
+        "batch": 4,   # reduced for longer WP sequences
     },
 }
 
@@ -93,7 +96,7 @@ def train(args: argparse.Namespace) -> None:
     state_file = output_dir / "training_state.pt"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Device: {DEVICE} | Dataset: {args.data}")
+    print(f"Device: {DEVICE} | Dataset: {args.data} | Grad accum: {args.grad_accum}")
 
     # ── Load model ──────────────────────────────────────────────────────────
     if args.resume and state_file.exists():
@@ -106,8 +109,8 @@ def train(args: argparse.Namespace) -> None:
         total_steps   = state["total_steps"]
         print(f"  Resuming from epoch {start_epoch} | best_val_loss={best_val_loss:.4f}")
     else:
-        tokenizer = BartTokenizerFast.from_pretrained(MODEL_NAME)
-        model     = BartForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+        tokenizer     = BartTokenizerFast.from_pretrained(MODEL_NAME)
+        model         = BartForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
         start_epoch   = 1
         best_val_loss = float("inf")
         total_steps   = None
@@ -122,9 +125,12 @@ def train(args: argparse.Namespace) -> None:
         batch_size=cfg["batch"], shuffle=False, num_workers=0,
     )
 
+    # Effective update steps per epoch (accounting for accumulation)
+    updates_per_epoch = len(train_loader) // args.grad_accum
+
     # ── Optimiser & scheduler ────────────────────────────────────────────────
     if total_steps is None:
-        total_steps = len(train_loader) * 3  # assume 3-epoch plan for LR schedule
+        total_steps = updates_per_epoch * 3   # assume 3-epoch LR schedule
 
     optimizer = AdamW(model.parameters(), lr=LR)
     scheduler = get_linear_schedule_with_warmup(
@@ -142,17 +148,24 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(start_epoch, end_epoch):
         model.train()
         running_loss = 0.0
+        optimizer.zero_grad()
+
         for step, batch in enumerate(train_loader, 1):
             batch = {k: v.to(DEVICE) for k, v in batch.items()}
-            loss  = model(**batch).loss
+            loss  = model(**batch).loss / args.grad_accum
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            running_loss += loss.item()
+            running_loss += loss.item() * args.grad_accum   # track true loss
+
+            # Parameter update every grad_accum steps (or at the final step)
+            if step % args.grad_accum == 0 or step == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
             if step % 200 == 0:
-                print(f"  Epoch {epoch} | step {step}/{len(train_loader)} | loss {running_loss/step:.4f}")
+                print(f"  Epoch {epoch} | step {step}/{len(train_loader)} "
+                      f"| loss {running_loss/step:.4f}")
 
         val_loss = evaluate(model, val_loader)
         print(f"Epoch {epoch} complete | val_loss={val_loss:.4f}")
@@ -161,7 +174,7 @@ def train(args: argparse.Namespace) -> None:
             best_val_loss = val_loss
             model.save_pretrained(output_dir)
             tokenizer.save_pretrained(output_dir)
-            print(f"  Best model saved to {output_dir}")
+            print(f"  ✓ Best model saved to {output_dir}")
 
         # Save training state after every epoch so Colab can resume
         torch.save({
@@ -175,10 +188,15 @@ def train(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data",   choices=["roc", "wp"], default="roc",
+    parser.add_argument("--data",       choices=["roc", "wp"], default="roc",
                         help="Dataset to train on (default: roc)")
-    parser.add_argument("--epochs", type=int, default=1,
+    parser.add_argument("--epochs",     type=int, default=1,
                         help="Epochs to train this session (default: 1)")
-    parser.add_argument("--resume", action="store_true",
+    parser.add_argument("--resume",     action="store_true",
                         help="Resume from last saved checkpoint")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        dest="grad_accum",
+                        help="Gradient accumulation steps (default: 1). "
+                             "Effective batch = batch_size × grad_accum. "
+                             "Recommended: 4 for WritingPrompts.")
     train(parser.parse_args())
